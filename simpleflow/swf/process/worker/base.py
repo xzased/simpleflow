@@ -7,21 +7,20 @@ import sys
 import traceback
 
 import psutil
+
 import simpleflow.registry
 import swf.actors
 import swf.exceptions
 import swf.format
-import simpleflow.registry
 from simpleflow.swf.constants import TRACEBACK_SIZE
 from simpleflow.swf.process.actor import (
     Supervisor,
     Poller,
     with_state,
 )
-from .dispatch import from_task_registry
-
 from simpleflow.swf.task import ActivityTask
 from simpleflow.utils import json_dumps
+from .dispatch import from_task_registry
 
 logger = logging.getLogger(__name__)
 
