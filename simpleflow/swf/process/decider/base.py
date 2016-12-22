@@ -41,6 +41,7 @@ class DeciderPoller(Poller, swf.actors.Decider):
     :type nb_retries: int
     """
     def __init__(self, workflow_executors, domain, task_list, nb_retries=3,
+                 is_standalone=False,
                  *args, **kwargs):
         """
         The decider is an actor that reads the full history of the workflow
@@ -82,7 +83,7 @@ class DeciderPoller(Poller, swf.actors.Decider):
                 raise ValueError(
                     'all workflows must be in the same domain "{}"'.format(
                         domain.name))
-            if ex.workflow.task_list != task_list:
+            if ex.workflow.task_list != task_list and not is_standalone:
                 raise ValueError(
                     'all workflows must have the same task list "{}"'.format(
                         task_list))
