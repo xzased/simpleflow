@@ -1,6 +1,7 @@
 from __future__ import absolute_import
 
 from simpleflow.base import Submittable
+from simpleflow.signal import WaitForSignal
 from . import canvas
 from . import task
 from ._decorators import deprecated
@@ -23,6 +24,7 @@ class Workflow(Submittable):
     name = None
     version = None
     task_list = None
+    task_priority = None
 
     def __init__(self, executor):
         self._executor = executor
@@ -52,7 +54,7 @@ class Workflow(Submittable):
             return self._executor.submit(submittable, *args, **kwargs)
         elif isinstance(submittable, (Activity, Workflow)):
             return self._executor.submit(submittable, *args, **kwargs)
-        elif isinstance(submittable, (task.Task, )):
+        elif isinstance(submittable, (task.Task, WaitForSignal)):
             return self._executor.submit(submittable)
         elif isinstance(submittable, canvas.Group):
             return submittable.submit(self._executor)
@@ -167,3 +169,9 @@ class Workflow(Submittable):
         :rtype: dict
         """
         return self.executor.get_execution_context()
+
+    def signal(self, name, *args, **kwargs):
+        return self.executor.signal(name, *args, **kwargs)
+
+    def wait_signal(self, name):
+        return self.executor.wait_signal(name)

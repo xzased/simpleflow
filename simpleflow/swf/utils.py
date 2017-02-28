@@ -48,3 +48,14 @@ def get_workflow_history_and_run_id(domain_name, workflow_id, run_id=None):
     """
     workflow_execution = get_workflow_execution(domain_name, workflow_id, run_id=run_id)
     return History(workflow_execution.history()), workflow_execution.run_id
+
+
+def sanitize_activity_context(context):
+    return {
+        "name": context["activityType"]["name"],
+        "version": context["activityType"]["version"],
+        "workflow_id": context["workflowExecution"]["workflowId"],
+        "run_id": context["workflowExecution"]["runId"],
+        "activity_id": context["activityId"],
+        "input": context["input"]
+    }

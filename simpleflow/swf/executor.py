@@ -17,12 +17,19 @@ from simpleflow import (
     futures,
     task,
 )
-from simpleflow.activity import Activity
+from simpleflow.activity import Activity, PRIORITY_NOT_SET
+from simpleflow.base import Submittable
 from simpleflow.history import History
-from simpleflow.swf import constants
+from simpleflow.signal import WaitForSignal
 from simpleflow.swf.helpers import swf_identity
-from simpleflow.swf.task import ActivityTask, WorkflowTask
+from simpleflow.swf.task import ActivityTask, WorkflowTask, SignalTask
+from simpleflow.task import (
+    ActivityTask as BaseActivityTask,
+    WorkflowTask as BaseWorkflowTask,
+    SignalTask as BaseSignalTask,
+)
 from simpleflow.utils import issubclass_, json_dumps, hex_hash
+from simpleflow.swf import constants
 from simpleflow.utils import retry
 from simpleflow.workflow import Workflow
 from swf.core import ConnectedSWFObject
@@ -136,7 +143,6 @@ class Executor(executor.Executor):
 
     :ivar domain: domain
     :type domain: swf.models.domain.Domain
-    :ivar workflow: workflow
     :ivar task_list: task list
     :type task_list: Optional[str]
     :ivar repair_with: previous history to use for repairing
@@ -168,6 +174,7 @@ class Executor(executor.Executor):
             self.force_activities = None
         self.reset()
 
+    # noinspection PyAttributeOutsideInit
     def reset(self):
         """
         Clears the state of the execution.
@@ -180,6 +187,9 @@ class Executor(executor.Executor):
         self._decisions = []
         self._tasks = TaskRegistry()
         self._idempotent_tasks_to_submit = set()
+        self._execution = None
+        self.current_priority = None
+        self.create_workflow()
 
     def _make_task_id(self, a_task, workflow_id, run_id, *args, **kwargs):
         """
@@ -329,8 +339,62 @@ class Executor(executor.Executor):
 
         return future
 
-    @staticmethod
-    def find_activity_event(a_task, history):
+    def get_future_from_signal_event(self, a_task, event):
+        """Maps a signal event to a Future with the corresponding
+        state.
+
+        :param a_task: currently unused
+        :type a_task: Optional[SignalTask]
+        :param event: signal event
+        :type  event: dict[str, Any]
+        """
+        future = futures.Future()
+        if not event:
+            return future
+        state = event['state']
+        if state == 'signaled':
+            future.set_finished(event['input'])
+
+        return future
+
+    def get_future_from_external_workflow_event(self, a_task, event):
+        """Maps an external workflow event to a Future with the corresponding
+        state.
+
+        :param a_task: currently unused
+        :type a_task:
+        :param event: external workflow event
+        :type  event: dict[str, Any]
+        """
+        future = futures.Future()
+        if not event:
+            return future
+        state = event['state']
+        if state == 'signal_execution_initiated':
+            # Don't re-initiate signal sending
+            future.set_running()
+        elif state == 'execution_signaled':
+            future.set_finished(event['input'])
+        elif state == 'signal_execution_failed':
+            future.set_exception(exceptions.TaskFailed(
+                name=event['name'],
+                reason=event['cause'],
+            ))
+
+        return future
+
+    def get_future_from_signal(self, signal_name):
+        """
+
+        :param signal_name:
+        :type signal_name: str
+        :return:
+         :rtype: futures.Future
+        """
+        event = self._history.signals.get(signal_name)
+        return self.get_future_from_signal_event(None, event)
+
+    def find_activity_event(self, a_task, history):
         """
         Get the event corresponding to a activity task, if any.
 
@@ -344,8 +408,7 @@ class Executor(executor.Executor):
         activity = history.activities.get(a_task.id)
         return activity
 
-    @staticmethod
-    def find_child_workflow_event(a_task, history):
+    def find_child_workflow_event(self, a_task, history):
         """
         Get the event corresponding to a child workflow, if any.
 
@@ -358,24 +421,48 @@ class Executor(executor.Executor):
         """
         return history.child_workflows.get(a_task.id)
 
-    def find_event(self, a_task, history):
+    def find_signal_event(self, a_task, history):
         """
-        Get the event corresponding to an activity or child workflow, if any
+        Get the event corresponding to a signal, if any.
+
         :param a_task:
-        :type a_task: ActivityTask | WorkflowTask
+        :type a_task: SignalTask
         :param history:
         :type history: simpleflow.history.History
         :return:
         :rtype: Optional[dict]
         """
-        # FIXME move this
-        event_type_to_finder = {
-            ActivityTask: self.find_activity_event,
-            WorkflowTask: self.find_child_workflow_event,
-        }
-        finder = event_type_to_finder.get(type(a_task))
+        # FIXME could look directly in signaled_workflows?
+        event = history.signals.get(a_task.name)
+        if not event:
+            if a_task.workflow_id is None:  # Broadcast, should be in signals
+                return None
+            signaled_workflows = history.signaled_workflows.get(a_task.name, [])
+            for w in signaled_workflows:
+                if w['workflow_id'] == a_task.workflow_id and (a_task.run_id is None or w['run_id'] == a_task.run_id):
+                    event = w
+                    break
+        return event
+
+    TASK_TYPE_TO_EVENT_FINDER = {
+        ActivityTask: find_activity_event,
+        WorkflowTask: find_child_workflow_event,
+        SignalTask: find_signal_event,
+    }
+
+    def find_event(self, a_task, history):
+        """
+        Get the event corresponding to an activity or child workflow, if any
+        :param a_task:
+        :type a_task: ActivityTask | WorkflowTask | SignalTask
+        :param history:
+        :type history: simpleflow.history.History
+        :return:
+        :rtype: Optional[dict]
+        """
+        finder = self.TASK_TYPE_TO_EVENT_FINDER.get(type(a_task))
         if finder:
-            return finder(a_task, history)
+            return finder(self, a_task, history)
         raise TypeError('invalid type {} for task {}'.format(
             type(a_task), a_task))
 
@@ -439,11 +526,9 @@ class Executor(executor.Executor):
         Let a task schedule itself.
         If too many decisions are in flight, add a timer decision and raise ExecutionBlocked.
         :param a_task:
-        :type a_task: ActivityTask | WorkflowTask
+        :type a_task: ActivityTask | WorkflowTask | SignalTask
         :param task_list:
         :type task_list: Optional[str]
-        :return:
-        :rtype:
         :raise: exceptions.ExecutionBlocked if too many decisions waiting
         """
 
@@ -454,8 +539,18 @@ class Executor(executor.Executor):
                 return
             self._idempotent_tasks_to_submit.add(task_identifier)
 
+        # if isinstance(a_task, SignalTask):
+        #     if a_task.workflow_id is None:
+        #         a_task.workflow_id = self._execution_context['workflow_id']
+        #         if a_task.run_id is None:
+        #             a_task.run_id = self._execution_context['run_id']
+
         # NB: ``decisions`` contains a single decision.
-        decisions = a_task.schedule(self.domain, task_list)
+        decisions = a_task.schedule(self.domain, task_list, priority=self.current_priority)
+
+        # Ready to schedule
+        if isinstance(a_task, ActivityTask):
+            self._open_activity_count += 1
 
         # Check if we won't violate the 1MB limit on API requests ; if so, do NOT
         # schedule the requested task and block execution instead, with a timer
@@ -471,13 +566,7 @@ class Executor(executor.Executor):
             self._add_start_timer_decision('resume-after-{}'.format(a_task.id))
             raise exceptions.ExecutionBlocked()
 
-        # Ready to schedule
-        logger.debug('executor is scheduling task {} on task_list {}'.format(
-            a_task.name,
-            task_list,
-        ))
         self._decisions.extend(decisions)
-        self._open_activity_count += 1
 
         # Check if we won't exceed max decisions -1
         # TODO: if we had exactly MAX_DECISIONS - 1 to take, this will wake up
@@ -495,6 +584,13 @@ class Executor(executor.Executor):
             start_to_fire_timeout='0')
         self._decisions.append(timer)
 
+    EVENT_TYPE_TO_FUTURE = {
+        'activity': resume_activity,
+        'child_workflow': resume_child_workflow,
+        'signal': get_future_from_signal_event,
+        'external_workflow': get_future_from_external_workflow_event,
+    }
+
     def resume(self, a_task, *args, **kwargs):
         """Resume the execution of a task.
         Called by `submit`.
@@ -504,7 +600,7 @@ class Executor(executor.Executor):
         If in repair mode, we may fake the task to repair from the previous history.
 
         :param a_task:
-        :type a_task: ActivityTask | WorkflowTask
+        :type a_task: ActivityTask | WorkflowTask | SignalTask
         :param args:
         :param args: list
         :type kwargs:
@@ -550,13 +646,9 @@ class Executor(executor.Executor):
 
         # back to normal execution flow
         if event:
-            event_type_to_future = {  # TODO move elsewhere
-                'activity': self.resume_activity,
-                'child_workflow': self.resume_child_workflow,
-            }
-            ttf = event_type_to_future.get(event['type'])
+            ttf = self.EVENT_TYPE_TO_FUTURE.get(event['type'])
             if ttf:
-                future = ttf(a_task, event)
+                future = ttf(self, a_task, event)
             if event['type'] == 'activity':
                 if future and future.state in (futures.PENDING, futures.RUNNING):
                     self._open_activity_count += 1
@@ -572,6 +664,33 @@ class Executor(executor.Executor):
 
         return future
 
+    def _compute_priority(self, priority_set_on_submit, a_task):
+        """
+        Computes the correct task priority, with the following precedence (first
+        is better/preferred):
+        - priority set with self.submit(..., __priority=<N>)
+        - priority set on the activity task decorator if any
+        - priority set on the workflow execution
+        - None otherwise
+
+        :param priority_set_on_submit:
+        :type  priority_set_on_submit: str|int|PRIORITY_NOT_SET
+
+        :param a_task:
+        :type  a_task: ActivityTask|WorkflowTask
+
+        :returns: the priority for this task
+        :rtype: str|int|None
+        """
+        if priority_set_on_submit is not PRIORITY_NOT_SET:
+            return priority_set_on_submit
+        elif (isinstance(a_task, ActivityTask) and
+              a_task.activity.task_priority is not PRIORITY_NOT_SET):
+            return a_task.activity.task_priority
+        elif self._workflow.task_priority is not PRIORITY_NOT_SET:
+            return self._workflow.task_priority
+        return None
+
     def submit(self, func, *args, **kwargs):
         """Register a function and its arguments for asynchronous execution.
 
@@ -579,17 +698,48 @@ class Executor(executor.Executor):
         :type func: simpleflow.base.Submittable | Activity | Workflow
 
         """
+        # NB: we don't set self.current_priority here directly, because we need
+        # to extract it from the underlying Activity() if it's not passed to
+        # self.submit() ; we DO need to pop the "__priority" kwarg though, so it
+        # doesn't pollute the rest of the code.
+        priority_set_on_submit = kwargs.pop("__priority", PRIORITY_NOT_SET)
+
+        # casts simpleflow.task.*Task to their equivalent in simpleflow.swf.task
+        if isinstance(func, BaseActivityTask) and not isinstance(func, ActivityTask):
+            func = ActivityTask.from_generic_task(func)
+        elif isinstance(func, BaseWorkflowTask) and not isinstance(func, WorkflowTask):
+            func = WorkflowTask.from_generic_task(func)
+        elif isinstance(func, BaseSignalTask) and not isinstance(func, SignalTask):
+            func = SignalTask.from_generic_task(func, self._workflow_id, self._run_id, None, None)
+
         try:
-            if isinstance(func, Activity):
+            # do not use directly "Submittable" here because we want to catch if
+            # we don't have an instance from a class known to work under simpleflow.swf
+            if isinstance(func, (ActivityTask, WorkflowTask, SignalTask)):
+                # no need to wrap it, already wrapped in the correct format
+                a_task = func
+            elif isinstance(func, Activity):
                 a_task = ActivityTask(func, *args, **kwargs)
             elif issubclass_(func, Workflow):
                 a_task = WorkflowTask(self, func, *args, **kwargs)
+            elif isinstance(func, WaitForSignal):
+                future = self.get_future_from_signal(func.signal_name)
+                logger.debug('submitted WaitForSignalTask({}): future={}'.format(func.signal_name, future))
+                return future
+            elif isinstance(func, Submittable):
+                raise TypeError(
+                    'invalid type Submittable {} for {} (you probably wanted a simpleflow.swf.task.*Task)'.format(
+                        type(func), func))
             else:
                 raise TypeError('invalid type {} for {}'.format(
                     type(func), func))
         except exceptions.ExecutionBlocked:
             return futures.Future()
 
+        # extract priority now that we have a *Task
+        self.current_priority = self._compute_priority(priority_set_on_submit, a_task)
+
+        # finally resume task
         return self.resume(a_task, *a_task.args, **a_task.kwargs)
 
     # TODO: check if really used or remove it
@@ -623,6 +773,7 @@ class Executor(executor.Executor):
         self._history = History(history)
         self._history.parse()
         self.build_execution_context(decision_response)
+        self._execution = decision_response.execution
 
         workflow_started_event = history[0]
         input = workflow_started_event.input
@@ -633,6 +784,7 @@ class Executor(executor.Executor):
 
         self.before_replay()
         try:
+            self.propagate_signals()
             result = self.run_workflow(*args, **kwargs)
         except exceptions.ExecutionBlocked:
             logger.info('{} open activities ({} decisions)'.format(
@@ -640,6 +792,7 @@ class Executor(executor.Executor):
                 len(self._decisions),
             ))
             self.after_replay()
+            self.decref_workflow()
             return self._decisions, {}
         except exceptions.TaskException as err:
             reason = 'Workflow execution error in task {}: "{}"'.format(
@@ -656,6 +809,7 @@ class Executor(executor.Executor):
                 details=swf.format.details(details),
             )
             self.after_closed()
+            self.decref_workflow()
             return [decision], {}
 
         except Exception as err:
@@ -676,6 +830,7 @@ class Executor(executor.Executor):
                 details=swf.format.details(details),
             )
             self.after_closed()
+            self.decref_workflow()
             return [decision], {}
 
         self.after_replay()
@@ -683,7 +838,14 @@ class Executor(executor.Executor):
         decision.complete(result=swf.format.result(json_dumps(result)))
         self.on_completed()
         self.after_closed()
+        self.decref_workflow()
         return [decision], {}
+
+    def decref_workflow(self):
+        """
+        Set the `_workflow` ivar to None in the hope of reducing memory consumption.
+        """
+        self._workflow = None
 
     def before_replay(self):
         return self._workflow.before_replay(self._history)
@@ -756,3 +918,90 @@ class Executor(executor.Executor):
     @property
     def _run_id(self):
         return self._execution_context.get('run_id')
+
+    def signal(self, name, workflow_id=None, run_id=None, propagate=True, *args, **kwargs):
+        """
+        Send a signal.
+        :param name:
+        :param workflow_id:
+        :param run_id:
+        :param propagate:
+        :param args:
+        :param kwargs:
+        :return:
+        """
+        logger.debug('signal: name={name}, workflow_id={workflow_id}, run_id={run_id}, propagate={propagate}'.format(
+            name=name,
+            workflow_id=workflow_id if workflow_id else self._workflow_id,
+            run_id=run_id if workflow_id else self._run_id,
+            propagate=propagate,
+        ))
+
+        extra_input = {'__propagate': False} if not propagate else None
+        return SignalTask(
+            name,
+            workflow_id=workflow_id if workflow_id else self._workflow_id,
+            run_id=run_id if workflow_id else self._run_id,
+            extra_input=extra_input,
+            *args,
+            **kwargs
+        )
+
+    def wait_signal(self, name):
+        logger.debug('{} - wait_signal({})'.format(self._workflow_id, name))
+        return WaitForSignal(name)
+
+    def propagate_signals(self):
+        """
+        Send every signals we got to our parent and children.
+        Don't send to workflows present in history.signaled_workflows.
+        """
+        history = self._history
+        if not history.signals:
+            return
+
+        known_workflows_ids = []
+        if self._execution_context['parent_workflow_id']:
+            known_workflows_ids.append(
+                (self._execution_context['parent_workflow_id'], self._execution_context['parent_run_id'])
+            )
+        known_workflows_ids.extend(
+            (w['workflow_id'], w['run_id']) for w in history.child_workflows.values() if w['state'] == 'started'
+        )
+
+        known_workflows_ids = frozenset(known_workflows_ids)
+
+        for signal in history.signals.values():
+            input = signal['input']
+            propagate = input.get('__propagate', True)
+            if not propagate:
+                continue
+            name = signal['name']
+            orig_workflow_id = input.get('__workflow_id')
+            orig_run_id = input.get('__run_id')
+
+            input = {
+                'args': input.get('args'),
+                'kwargs': input.get('kwargs'),
+                '__workflow_id': self._workflow_id,
+                '__run_id': self._run_id,
+            }
+            sender = (
+                signal['external_workflow_id'] or orig_workflow_id,
+                signal['external_run_id'] or orig_run_id
+            )
+            signaled_workflows_ids = set(
+                (w['workflow_id'], w['run_id']) for w in history.signaled_workflows[name]
+            )
+            signaled_workflows_ids.add((orig_workflow_id, orig_run_id))
+            not_signaled_workflows_ids = list(known_workflows_ids - signaled_workflows_ids - {sender})
+            for workflow_id, run_id in not_signaled_workflows_ids:
+                try:
+                    self._execution.signal(
+                        signal_name=name,
+                        input=input,
+                        workflow_id=workflow_id,
+                        run_id=run_id,
+                    )
+                except swf.models.workflow.WorkflowExecutionDoesNotExist:
+                    logger.info('Workflow {} {} disappeared'.format(workflow_id, run_id))

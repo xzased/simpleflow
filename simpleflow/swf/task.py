@@ -12,6 +12,12 @@ class ActivityTask(task.ActivityTask):
     """
     Activity task managed on SWF.
     """
+    @classmethod
+    def from_generic_task(cls, task):
+        """
+        Casts a generic simpleflow.task.ActivityTask into a SWF one.
+        """
+        return cls(task.activity, *task._args, **task._kwargs)
 
     @property
     def task_list(self):
@@ -26,7 +32,6 @@ class ActivityTask(task.ActivityTask):
         :param task_list:
         :type task_list: Optional[str]
         :param kwargs:
-        :type kwargs: dict
         :return:
         :rtype: list[swf.models.decision.Decision]
         """
@@ -62,6 +67,7 @@ class ActivityTask(task.ActivityTask):
             'heartbeat_timeout',
             activity.task_heartbeat_timeout,
         )
+        task_priority = kwargs.get('priority')
 
         decision = swf.models.decision.ActivityTaskDecision(
             'schedule',
@@ -74,6 +80,7 @@ class ActivityTask(task.ActivityTask):
             duration_timeout=str(duration_timeout) if duration_timeout else None,
             schedule_timeout=str(schedule_timeout) if schedule_timeout else None,
             heartbeat_timeout=str(heartbeat_timeout) if heartbeat_timeout else None,
+            task_priority=task_priority,
         )
 
         return [decision]
@@ -83,6 +90,12 @@ class WorkflowTask(task.WorkflowTask):
     """
     WorkflowTask managed on SWF.
     """
+    @classmethod
+    def from_generic_task(cls, task):
+        """
+        Casts a generic simpleflow.task.WorkflowTask into a SWF one.
+        """
+        return cls(task.executor, task.workflow, *task._args, **task._kwargs)
 
     @property
     def name(self):
@@ -92,7 +105,7 @@ class WorkflowTask(task.WorkflowTask):
     def task_list(self):
         return getattr(self.workflow, 'task_list', None)
 
-    def schedule(self, domain, task_list=None):
+    def schedule(self, domain, task_list=None, priority=None):
         """
         Schedule a child workflow.
 
@@ -100,6 +113,8 @@ class WorkflowTask(task.WorkflowTask):
         :type domain: swf.models.Domain
         :param task_list:
         :type task_list: Optional[str]
+        :param priority: ignored (only there for compatibility reasons with ActivityTask)
+        :type priority: Optional[str|int]
         :return:
         :rtype: list[swf.models.decision.Decision]
         """
@@ -133,6 +148,70 @@ class WorkflowTask(task.WorkflowTask):
             tag_list=tag_list,
             child_policy=getattr(workflow, 'child_policy', None),
             execution_timeout=str(execution_timeout) if execution_timeout else None,
+        )
+
+        return [decision]
+
+
+class SignalTask(task.SignalTask):
+    """
+    Signal "task" on SWF.
+    """
+    @classmethod
+    def from_generic_task(cls, a_task, workflow_id, run_id, control, extra_input):
+        return cls(a_task.name, workflow_id, run_id, control, extra_input, *a_task.args, **a_task.kwargs)
+
+    def __init__(self, name, workflow_id, run_id, control=None, extra_input=None, *args, **kwargs):
+        super(SignalTask, self).__init__(name, *args, **kwargs)
+        self.workflow_id = workflow_id
+        self.run_id = run_id
+        self.control = control
+        self.extra_input = extra_input
+
+    @property
+    def id(self):
+        return self._name
+
+    @property
+    def idempotent(self):
+        return None
+
+    def __repr__(self):
+        return '{}(name={}, workflow_id={}, run_id={}, control={}, args={}, kwargs={})'.format(
+            self.__class__.__name__,
+            self.name,
+            self.workflow_id,
+            self.run_id,
+            self.control,
+            self.args,
+            self.kwargs,
+        )
+
+    def schedule(self, domain, task_list, priority=None):
+        input = {
+            'args': self.args,
+            'kwargs': self.kwargs,
+            '__workflow_id': self.workflow_id,
+            '__run_id': self.run_id,
+        }
+        if self.extra_input:
+            input.update(self.extra_input)
+        logger.debug(
+            'scheduling signal name={name}, workflow_id={workflow_id}, run_id={run_id}, control={control}'.format(
+                name=self.name,
+                workflow_id=self.workflow_id,
+                run_id=self.run_id,
+                control=self.control,
+            )
+        )
+
+        decision = swf.models.decision.ExternalWorkflowExecutionDecision()
+        decision.signal(
+            signal_name=self.name,
+            input=input,
+            workflow_id=self.workflow_id,
+            run_id=self.run_id,
+            control=self.control,
         )
 
         return [decision]

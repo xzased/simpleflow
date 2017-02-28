@@ -1,4 +1,5 @@
 from __future__ import print_function
+
 import time
 
 from simpleflow import (
@@ -7,7 +8,6 @@ from simpleflow import (
     Workflow,
 )
 from simpleflow.canvas import Group, Chain
-from simpleflow.task import ActivityTask
 
 
 @activity.with_attributes(task_list='example', version='example')
@@ -22,6 +22,11 @@ def multiply(numbers):
     for n in numbers:
         val *= n
     return val
+
+
+@activity.with_attributes(task_list='example', version='example')
+def fail_incrementing(_):
+    raise ValueError("Failure on CPU intensive operation '+'")
 
 
 # This workflow demonstrates the use of simpleflow's Chains and Groups
@@ -45,11 +50,11 @@ class CanvasWorkflow(Workflow):
         future = self.submit(
             Chain(
                 Group(
-                    ActivityTask(increment_slowly, x),
-                    ActivityTask(increment_slowly, y),
-                    ActivityTask(increment_slowly, z),
+                    (increment_slowly, x),
+                    (increment_slowly, y),
+                    (increment_slowly, z),
                 ),
-                ActivityTask(multiply),
+                multiply,
                 send_result=True
             )
         )
@@ -58,3 +63,31 @@ class CanvasWorkflow(Workflow):
         res = future.result[-1]
 
         print('({}+1)*({}+1)*({}+1) = {}'.format(x, y, z, res))
+
+        # Canvas's and Group's can also be "optional"
+        future = self.submit(
+            Chain(
+                (fail_incrementing, x),
+                (increment_slowly, 1),  # never executed
+                (multiply, [2]),
+                raises_on_failure=False,
+            )
+        )
+
+        futures.wait(future)
+
+        # Failing inside a chain doesn't stop a upper chain
+        future = self.submit(
+            Chain(
+                Chain(
+                    (fail_incrementing, x),
+                    raises_on_failure=False,
+                ),
+                (increment_slowly, 1),  # executed
+                (multiply, [2]),
+            )
+        )
+
+        futures.wait(future)
+
+        print('SUCCESS!')

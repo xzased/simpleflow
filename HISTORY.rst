@@ -1,6 +1,49 @@
 Changelog
 ---------
 
+0.14.2
+~~~~~~
+
+- propagate_attribute: skip signal objects (#215)
+- Local executor: check add_activity_task (#215)
+
+0.14.1
+~~~~~~
+
+- Don't send exception up if raises_on_failure is false (#213)
+- Fix UnicodeDecodeError on windows machine (#211)
+- Try to use less memory (#209)
+- Standalone mode: use created task list for children activities (#207)
+
+0.14.0
+~~~~~~
+
+- Fix workers not stopping in case they start during a shutdown (#205)
+- Add support for SWF signals (#188)
+- Improvements on canvas.Group (#204)
+
+0.13.4
+~~~~~~
+
+- Implement metrology on SWF and local workflows (#186)
+
+0.13.3
+~~~~~~
+
+- Try..except pass for NoSuchProcess (#182)
+
+0.13.2
+~~~~~~
+
+- Add optional canvas (#193)
+- Reorganize tests/ directory (#198)
+- Relax DeciderPoller task list check (#201)
+- Implement priorities on SWF tasks (#199)
+
+0.13.1
+~~~~~~
+
+- Fix SWF executor not accepting ActivityTask's in submit() method (#196)
 
 0.13.0
 ~~~~~~

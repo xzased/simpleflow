@@ -65,32 +65,30 @@ class DeciderPoller(Poller, swf.actors.Decider):
         """
         self._workflow_name = '{}'.format(','.join(
             [
-                ex.workflow.name for ex in workflow_executors
+                ex.workflow_class.name for ex in workflow_executors
                 ]))
 
         # Maps a workflow's name to its definition.
         # Used to dispatch a decision task to the corresponding workflow.
         self._workflow_executors = {
-            executor.workflow.name: executor for executor in workflow_executors
-            }
+            executor.workflow_class.name: executor for executor in workflow_executors
+        }
 
-        if not task_list:
-            task_list = workflow_executors[0].workflow.task_list
-
-        # All executors must have the same domain and task list.
-        for ex in workflow_executors:
-            if ex.domain.name != domain.name:
-                raise ValueError(
-                    'all workflows must be in the same domain "{}"'.format(
-                        domain.name))
-            if ex.workflow.task_list != task_list and not is_standalone:
-                raise ValueError(
-                    'all workflows must have the same task list "{}"'.format(
-                        task_list))
+        if task_list:
+            self.task_list = task_list
+        else:
+            self.task_list = workflow_executors[0].workflow_class.task_list
+            # If not passed explicitly, all executors must use the same task list
+            # else it's probably a mistake so we raise an error.
+            self._check_all_task_lists_identical()
 
         self.nb_retries = nb_retries
+        self.domain = domain
 
-        super(DeciderPoller, self).__init__(domain, task_list)
+        # All executors must have the same domain.
+        self._check_all_domains_identical()
+
+        super(DeciderPoller, self).__init__(domain, self.task_list)
 
     def __repr__(self):
         return '{cls}({domain}, {task_list}, {workflows})'.format(
@@ -99,6 +97,21 @@ class DeciderPoller(Poller, swf.actors.Decider):
             task_list=self.task_list,
             workflows=','.join(self._workflow_executors),
         )
+
+    def _check_all_domains_identical(self):
+        for ex in self._workflow_executors.values():
+            if ex.domain.name != self.domain.name:
+                raise ValueError(
+                    'all workflows must be in the same domain "{}"'.format(
+                        self.domain.name))
+
+    def _check_all_task_lists_identical(self):
+        for ex in self._workflow_executors.values():
+            if ex.workflow_class.task_list != self.task_list:
+                raise ValueError(
+                    'all workflows must have the same task list '
+                    '"{}" unless you specify it explicitly'.format(
+                        self.task_list))
 
     @property
     def name(self):
@@ -154,7 +167,7 @@ class DeciderPoller(Poller, swf.actors.Decider):
         :rtype: list[swf.models.decision.base.Decision]
         """
         worker = DeciderWorker(self.domain, self._workflow_executors)
-        decisions = worker.decide(decision_response)
+        decisions = worker.decide(decision_response, self.task_list)
         return decisions
 
 
@@ -171,12 +184,14 @@ class DeciderWorker(object):
         self._domain = domain
         self._workflow_executors = workflow_executors
 
-    def decide(self, decision_response):
+    def decide(self, decision_response, task_list):
         """
         Delegate the decision to the executor, loading it if needed.
 
         :param decision_response: an object wrapping the PollForDecisionTask response.
         :type  decision_response: swf.responses.Response
+        :param task_list:
+        :type task_list: Optional[str]
 
         :returns: the decisions.
         :rtype: list[swf.models.decision.base.Decision]
@@ -190,6 +205,7 @@ class DeciderWorker(object):
             workflow_executor = helpers.load_workflow_executor(
                 self._domain,
                 workflow_name,
+                task_list=task_list,
             )
             self._workflow_executors[workflow_name] = workflow_executor
         try:

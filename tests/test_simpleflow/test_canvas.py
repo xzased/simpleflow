@@ -35,6 +35,9 @@ def sum_previous(values, previous_value):
 
 @with_attributes()
 def running_task():
+    """
+    Special task: always running according to CustomExecutor.
+    """
     return True
 
 
@@ -52,12 +55,21 @@ class CustomExecutor(Executor):
     def submit(self, func, *args, **kwargs):
         if func == running_task:
             f = futures.Future()
-            f._state = futures.RUNNING
+            f.set_running()
             return f
         return super(CustomExecutor, self).submit(func, *args, **kwargs)
 
 
-executor = CustomExecutor(workflow.Workflow)
+class MyWorkflow(workflow.Workflow):
+    name = 'test_workflow'
+    version = 'test_version'
+    task_list = 'test_task_list'
+    decision_tasks_timeout = '300'
+    execution_timeout = '3600'
+
+
+executor = CustomExecutor(MyWorkflow)
+executor.initialize_history({})
 
 
 class TestGroup(unittest.TestCase):
@@ -77,7 +89,27 @@ class TestGroup(unittest.TestCase):
         self.assertEquals(future.count_finished_activities, 2)
         self.assertEquals(future._result, ["test1", None, 3])
         with self.assertRaises(exceptions.ExecutionBlocked):
-            dummy = future.result
+            future.result
+
+    def test_simplified_declaration(self):
+        future = Group(
+            (to_string, 1),
+            (to_string, 2)
+        ).submit(executor)
+        self.assertTrue(future.finished)
+
+        group = Group()
+        group += [
+            ActivityTask(to_string, "test1"),
+            running_task,
+            (sum_values, [1, 2]),
+        ]
+        future = group.submit(executor)
+        self.assertTrue(future.running)
+        self.assertEquals(future.count_finished_activities, 2)
+        self.assertEquals(future._result, ["test1", None, 3])
+        with self.assertRaises(exceptions.ExecutionBlocked):
+            future.result
 
     def test_exceptions(self):
         future = Group(
@@ -161,16 +193,59 @@ class TestChain(unittest.TestCase):
         ).submit(executor)
         self.assertIsNone(future.exception)
 
+        # Do not execute the 3rd step is the 2nd is failing on chains
         future = Chain(
+            ActivityTask(to_string, "test1"),
             ActivityTask(zero_division),
-            ActivityTask(zero_division),
+            ActivityTask(to_string, "test2"),
         ).submit(executor)
         self.assertTrue(future.finished)
         self.assertIsInstance(future.exception, AggregateException)
         # Both tasks were tried and failed (being in a chain doesn't change this)
         self.assertEqual(2, len(future.exception.exceptions))
-        self.assertIsInstance(future.exception.exceptions[0], ZeroDivisionError)
+        self.assertIsNone(future.exception.exceptions[0])
         self.assertIsInstance(future.exception.exceptions[1], ZeroDivisionError)
+
+    def test_raises_on_failure(self):
+        chain = Chain(
+            ActivityTask(to_string, "test1"),
+            ActivityTask(zero_division),
+            raises_on_failure=False
+        )
+        self.assertFalse(chain.activities[0].activity.raises_on_failure)
+        self.assertFalse(chain.activities[1].activity.raises_on_failure)
+
+        chain = Chain(
+            ActivityTask(to_string, "test1"),
+            ActivityTask(zero_division),
+            raises_on_failure=True
+        )
+        self.assertTrue(chain.activities[0].activity.raises_on_failure)
+        self.assertTrue(chain.activities[1].activity.raises_on_failure)
+
+    def test_raises_on_failure_doesnt_set_exception(self):
+        future = Chain(
+            ActivityTask(zero_division),
+            ActivityTask(to_string, "test1"),
+            raises_on_failure=False
+        ).submit(executor)
+        self.assertEqual(1, future.count_finished_activities)
+        self.assertIsNone(future.exception)
+
+    def test_signals_dont_hurt(self):
+        """
+        Check that propagate_attribute doesn't fail on signal-related objects
+        :return:
+        """
+        future = Chain(
+            ActivityTask(to_string, 1),
+            executor.signal('test'),
+            ActivityTask(to_string, 2),
+            executor.wait_signal('test'),
+            raises_on_failure=False
+        ).submit(executor)
+        self.assertEqual(4, future.count_finished_activities)
+        self.assertIsNone(future.exception)
 
 
 class TestFuncGroup(unittest.TestCase):
@@ -188,6 +263,31 @@ class TestFuncGroup(unittest.TestCase):
             send_result=True).submit(executor)
         self.assertEquals(chain.result, [3, [0, 2, 4], 6])
 
+    def test_raises_on_failure(self):
+        def custom_func():
+            group = Group()
+            for i in range(0, 2):
+                group.append(ActivityTask(zero_division))
+            return group
+
+        fngrp = FuncGroup(custom_func, raises_on_failure=False)
+        # We have to submit the funcgroup to create
+        # the activities
+        fngrp.submit(executor)
+        self.assertFalse(fngrp.activities.activities[0].activity.raises_on_failure)
+
+        def custom_func():
+            group = Group()
+            for i in range(0, 2):
+                group.append(ActivityTask(zero_division))
+            return group
+
+        fngrp = FuncGroup(custom_func, raises_on_failure=True)
+        # We have to submit the funcgroup to create
+        # the activities
+        with self.assertRaises(exceptions.TaskFailed):
+            fngrp.submit(executor)
+
 
 class TestComplexCanvas(unittest.TestCase):
     def test(self):
@@ -203,6 +303,41 @@ class TestComplexCanvas(unittest.TestCase):
                 ActivityTask(running_task, 1)
             ),
             ActivityTask(sum_values, [1, 2])
+        )
+        result = complex_canvas.submit(executor)
+
+        self.assertFalse(result.finished)
+        self.assertTrue(result.futures[0].finished)
+        self.assertTrue(result.futures[1].finished)
+        self.assertTrue(result.futures[2].finished)
+        self.assertFalse(result.futures[3].finished)
+        self.assertTrue(result.futures[3].futures[0].finished)
+        self.assertFalse(result.futures[3].futures[1].finished)
+        # As result.futures[3] is not finished, we shouldn't find other future
+        self.assertEquals(len(result.futures), 4)
+
+        # Change the state of the n-1 chain to make the whole
+        # canvas done
+        complex_canvas.activities[3].activities[1] = ActivityTask(to_int, 1)
+        result = complex_canvas.submit(executor)
+        self.assertTrue(result.finished)
+        self.assertEquals(len(result.futures), 5)
+
+
+class TestComplexCanvasSimplifiedDeclaration(unittest.TestCase):
+    def test(self):
+        complex_canvas = Chain(
+            (sum_values, [1, 2]),
+            (sum_values, [1, 2]),
+            Group(
+                (to_int, 1),
+                (to_int, 2),
+            ),
+            Chain(
+                (sum_values, [1, 2]),
+                running_task,
+            ),
+            (sum_values, [1, 2])
         )
         result = complex_canvas.submit(executor)
 

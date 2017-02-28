@@ -2,7 +2,6 @@ import json
 import logging
 import multiprocessing
 import os
-import signal
 import traceback
 
 import psutil
@@ -12,6 +11,7 @@ import swf.format
 from simpleflow.process import Supervisor, with_state
 from simpleflow.swf.process import Poller
 from simpleflow.swf.task import ActivityTask
+from simpleflow.swf.utils import sanitize_activity_context
 from simpleflow.utils import json_dumps
 
 from .dispatch import dynamic_dispatcher
@@ -33,7 +33,7 @@ class ActivityPoller(Poller, swf.actors.ActivityWorker):
     Polls an activity and handles it in the worker.
 
     """
-    def __init__(self, domain, task_list, heartbeat=60, *args, **kwargs):
+    def __init__(self, domain, task_list, heartbeat=60):
         """
 
         :param domain:
@@ -42,10 +42,6 @@ class ActivityPoller(Poller, swf.actors.ActivityWorker):
         :type task_list:
         :param heartbeat:
         :type heartbeat:
-        :param args:
-        :type args:
-        :param kwargs:
-        :type kwargs:
         """
         self.nb_retries = 3
         # heartbeat=0 is a special value to disable heartbeating. We want to
@@ -140,8 +136,9 @@ class ActivityWorker(object):
         input = json.loads(task.input)
         args = input.get('args', ())
         kwargs = input.get('kwargs', {})
+        context = sanitize_activity_context(task.context)
         try:
-            result = ActivityTask(activity, *args, context=task.context, **kwargs).execute()
+            result = ActivityTask(activity, *args, context=context, **kwargs).execute()
         except Exception as err:
             logger.exception("process error: {}".format(str(err)))
             tb = traceback.format_exc()

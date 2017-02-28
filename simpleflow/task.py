@@ -1,6 +1,7 @@
 from __future__ import absolute_import
 
 import abc
+from copy import deepcopy
 
 from simpleflow.base import Submittable
 from . import futures
@@ -42,13 +43,17 @@ class ActivityTask(Task):
 
     :type activity: Activity
     :type idempotent: Optional[bool]
-    :type args: list[Any]
-    :type kwargs: dict[Any, Any]
     :type id: str
     """
     def __init__(self, activity, *args, **kwargs):
         if not isinstance(activity, Activity):
             raise TypeError('Wrong value for `activity`, got {} instead'.format(type(activity)))
+        # Keep original arguments for use in subclasses
+        # For instance this helps casting a generic class to a simpleflow.swf.task,
+        # see simpleflow.swf.task.ActivityTask.from_generic_task() factory
+        self._args = deepcopy(args)
+        self._kwargs = deepcopy(kwargs)
+
         self.activity = activity
         self.idempotent = activity.idempotent
         self.context = kwargs.pop("context", None)
@@ -88,11 +93,15 @@ class WorkflowTask(Task):
 
     :type executor: type(simpleflow.executor.Executor)
     :type workflow: type(simpleflow.workflow.Workflow)
-    :type args: list[Any]
-    :type kwargs: dict[Any, Any]
     :type id: str
     """
     def __init__(self, executor, workflow, *args, **kwargs):
+        # Keep original arguments for use in subclasses
+        # For instance this helps casting a generic class to a simpleflow.swf.task,
+        # see simpleflow.swf.task.WorkflowTask.from_generic_task() factory
+        self._args = deepcopy(args)
+        self._kwargs = deepcopy(kwargs)
+
         self.executor = executor
         self.workflow = workflow
         self.idempotent = getattr(workflow, 'idempotent', False)
@@ -122,3 +131,26 @@ class WorkflowTask(Task):
     def execute(self):
         workflow = self.workflow(self.executor)
         return workflow.run(*self.args, **self.kwargs)
+
+
+class SignalTask(Task):
+    """
+    Signal.
+    """
+
+    def __init__(self, name, *args, **kwargs):
+        self._name = name
+        self.args = self.resolve_args(*args)
+        self.kwargs = self.resolve_kwargs(**kwargs)
+
+    @property
+    def name(self):
+        """
+
+        :return:
+        :rtype: str
+        """
+        return self._name
+
+    def execute(self):
+        pass
