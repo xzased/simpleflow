@@ -30,6 +30,7 @@ class Workflow(Submittable):
     version = None
     task_list = None
     task_priority = None
+    lambda_role = None
 
     def __init__(self, executor):
         self._executor = executor
