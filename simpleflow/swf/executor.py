@@ -25,7 +25,7 @@ from simpleflow.marker import Marker
 from simpleflow.signal import WaitForSignal
 from simpleflow.swf import constants
 from simpleflow.swf.helpers import swf_identity
-from simpleflow.swf.task import ActivityTask, WorkflowTask, SignalTask, MarkerTask, SwfTask
+from simpleflow.swf.task import ActivityTask, WorkflowTask, SignalTask, MarkerTask, SwfTask, LambdaFunctionTask
 from simpleflow.utils import (
     hex_hash,
     issubclass_,
@@ -321,7 +321,7 @@ class Executor(executor.Executor):
             future.set_finished(json_loads_or_raw(event['result']))
         elif state == 'failed':
             future.set_exception(exceptions.TaskFailed(
-                name=event['id'],
+                name=event['name'],
                 reason=event['reason'],
                 details=event.get('details'),
             ))
@@ -336,6 +336,43 @@ class Executor(executor.Executor):
             ))
         elif state == 'terminated':
             future.set_exception(exceptions.TaskTerminated())
+
+        return future
+
+    def _get_future_from_lambda_function_event(self, event):
+        """
+
+        :param event: child workflow event
+        :type  event: dict[str, Any]
+        :return:
+        :rtype: futures.Future
+        """
+        future = futures.Future()
+        state = event['state']
+
+        if state == 'scheduled':
+            pass
+        elif state == 'schedule_failed':
+            logger.info('failed to schedule {}: {}'.format(
+                event['name'],
+                event['cause'],
+            ))
+            return None
+        elif state == 'started':
+            future.set_running()
+        elif state == 'completed':
+            future.set_finished(json_loads_or_raw(event['result']))
+        elif state == 'failed':
+            future.set_exception(exceptions.TaskFailed(
+                name=event['name'],
+                reason=event['reason'],
+                details=event.get('details'),
+            ))
+        elif state == 'timed_out':
+            future.set_exception(exceptions.TimeoutError(
+                event['timeout_type'],
+                None,
+            ))
 
         return future
 
@@ -447,6 +484,19 @@ class Executor(executor.Executor):
         """
         return history.child_workflows.get(a_task.id)
 
+    def find_lambda_function_event(self, a_task, history):
+        """
+        Get the event corresponding to a lambda function, if any.
+
+        :param a_task:
+        :type a_task: LambdaFunctionTask
+        :param history:
+        :type history: simpleflow.history.History
+        :return:
+        :rtype: Optional[dict]
+        """
+        return history.lambda_functions.get(a_task.id)
+
     def find_signal_event(self, a_task, history):
         """
         Get the event corresponding to a signal, if any.
@@ -496,6 +546,7 @@ class Executor(executor.Executor):
         WorkflowTask: find_child_workflow_event,
         SignalTask: find_signal_event,
         MarkerTask: find_marker_event,
+        LambdaFunctionTask: find_lambda_function_event,
     }
 
     def find_event(self, a_task, history):
@@ -569,12 +620,30 @@ class Executor(executor.Executor):
 
         return future
 
+    def resume_lambda_function(self, a_task, event):
+        """
+        Resume a child workflow.
+
+        :param a_task:
+        :type a_task: LambdaTask
+        :param event:
+        :type event: dict
+        :return:
+        :rtype: simpleflow.futures.Future
+        """
+        future = self._get_future_from_lambda_function_event(event)
+
+        if future.finished and future.exception:
+            raise future.exception
+
+        return future
+
     def schedule_task(self, a_task, task_list=None):
         """
         Let a task schedule itself.
         If too many decisions are in flight, add a timer decision and raise ExecutionBlocked.
         :param a_task:
-        :type a_task: ActivityTask | WorkflowTask | SignalTask | MarkerTask
+        :type a_task: SwfTask
         :param task_list:
         :type task_list: Optional[str]
         :raise: exceptions.ExecutionBlocked if too many decisions waiting
@@ -640,6 +709,7 @@ class Executor(executor.Executor):
         'signal': get_future_from_signal_event,
         'external_workflow': get_future_from_external_workflow_event,
         'marker': _get_future_from_marker_event,
+        'lambda_function': resume_lambda_function,
     }
 
     def resume(self, a_task, *args, **kwargs):
@@ -651,7 +721,7 @@ class Executor(executor.Executor):
         If in repair mode, we may fake the task to repair from the previous history.
 
         :param a_task:
-        :type a_task: ActivityTask | WorkflowTask | SignalTask
+        :type a_task: ActivityTask | WorkflowTask | SignalTask | LambdaTask
         :param args:
         :param args: list
         :type kwargs:
@@ -765,7 +835,7 @@ class Executor(executor.Executor):
         try:
             # do not use directly "Submittable" here because we want to catch if
             # we don't have an instance from a class known to work under simpleflow.swf
-            if isinstance(func, (ActivityTask, WorkflowTask, SignalTask, MarkerTask)):
+            if isinstance(func, SwfTask):
                 # no need to wrap it, already wrapped in the correct format
                 a_task = func
             elif isinstance(func, Activity):

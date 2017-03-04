@@ -6,6 +6,11 @@ import swf.models.decision
 from simpleflow import task
 from simpleflow.utils import json_dumps
 
+
+if False:
+    from simpleflow.lambda_function import LambdaFunction
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -248,3 +253,35 @@ class MarkerTask(task.MarkerTask, SwfTask):
 
     def get_json_details(self):
         return json_dumps(self.details) if self.details is not None else None
+
+
+class LambdaFunctionTask(task.Task, SwfTask):
+
+    def __init__(self, lambda_function, *args, **kwargs):
+        # type: (LambdaFunction) -> None
+        self.lambda_function = lambda_function
+        self.args = self.resolve_args(*args)
+        self.kwargs = self.resolve_kwargs(**kwargs)
+        self.idempotent = lambda_function.idempotent
+        self.id = None
+
+    @property
+    def name(self):
+        return self.lambda_function.name
+
+    def schedule(self, *args, **kwargs):
+        input = {
+            'args': self.args,
+            'kwargs': self.kwargs,
+        }
+
+        decision = swf.models.decision.LambdaFunctionDecision(
+            'schedule',
+            id=self.id,
+            name=self.name,
+            input=input,
+            start_to_close_timeout=str(self.lambda_function.start_to_close_timeout) if self.lambda_function.start_to_close_timeout
+            else None,
+        )
+
+        return [decision]
